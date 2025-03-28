@@ -39,6 +39,7 @@ cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DWITH_PYTHON=ON \
   -DWITH_PYTHON3=ON \
+  -DWITH_IPOPT=ON \
   -DPYTHON_EXECUTABLE=$(which python3)
 
 6. 
