@@ -1,6 +1,7 @@
 Installere Casadi på NVIDIA Jetson Nano:
 
-VIKTIG: Numpy version må være 1.19.4!
+VIKTIG: Numpy version må være 1.19.4! 
+Feilmelding som kom hvis ikke denne er korrekt: Illegal instruction (core dumped)
 
 1. 
 
