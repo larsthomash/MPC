@@ -1,0 +1,53 @@
+Installere Casadi på NVIDIA Jetson Nano:
+
+VIKTIG: Numpy version må være 1.19.4!
+
+1. 
+
+sudo apt update
+sudo apt install -y \
+    build-essential \
+    cmake \
+    g++ \
+    git \
+    python3-dev \
+    python3-pip \
+    python3-numpy
+
+
+2. 
+
+pip3 install "numpy==1.19.4"
+
+3. 
+
+git clone https://github.com/casadi/casadi.git
+cd casadi
+git checkout 3.6.7
+
+4. 
+
+mkdir build
+cd build
+
+5. 
+
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWITH_PYTHON=ON \
+  -DWITH_PYTHON3=ON \
+  -DPYTHON_EXECUTABLE=$(which python3)
+
+6. 
+
+make -j2
+
+7.
+
+cd build
+sudo make install
+
+8. --- Test ---
+
+python3 -c "import casadi; print(casadi.__version__)"
+
