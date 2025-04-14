@@ -9,8 +9,10 @@
     @author Thomas Matre
 """
 
-import can, time, json, threading, os
+import can, time, json, threading, gi, os
 os.chdir(os.path.dirname(os.path.abspath(__file__))) # Bytter working directory til den nåværende slik at programmet kan startes utenfra mappa
+import casadi as ca
+import struct
 from drivers.network_handler import Network 
 from drivers.STTS75_driver import STTS75; 
 from drivers.camPWM import ServoPWM; 
@@ -19,13 +21,11 @@ from functions.fFormating import getBit, getByte, getNum, setBit, toJson
 from functions.fPacketBuild import packetBuild
 from functions.fNetcallParsing import int8Parse, int16Parse, int32Parse, int64Parse, uint8Parse, uint16Parse, uint32Parse, uint64Parse, fuselightParse, sensorflagsParse, regParamsParse, regflagsParse
 from functions.fCancallParsing import canint16Parse, canint8Parse, canSensorAlarmsParse, canuint16Parse, canuint8Parse, canHBParse, can12VParse
-from controller.MPC import MPCController, MPCParameters, mpc_step
-
-#gi.require_version("Gst", "1.0")
-#from gi.repository import Gst, GLib
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst, GLib
+from controller.MPC import MPCController, MPCParameters, MPCTrajectory, mpc_step
 
 #Packets recived from topside and sent to ROV
-JBCSHSAC      = 31
 REGCONTROL    = 32
 ROVCMD        = 33
 MANICMD       = 34
@@ -37,7 +37,6 @@ SYS5VFLAGS    = 97
 THR12VFLAGS   = 98
 MANI12VFLAGS  = 99
 canSendDict  = {
-      JBCSHSAC : int8Parse,
       REGCONTROL:   regflagsParse,
       ROVCMD:       int8Parse,
       MANICMD:      int8Parse,
@@ -141,17 +140,63 @@ def i2cThread(netHandler, STTS75, systemFlag):
   print("i2c Thread stopped")
 
 # Computes desired velocities based on position error
-def mpcThread(mpcController, mpcParameters, systemFlag, sendCanPacket):
+def mpcThread(mpcParameters, mpcTrajectory, mpcController, systemFlag, sendCanPacket):
   print("MPC Thread started")
+  firstRun = 1
   while systemFlag['Can']:
-    if mpcParameters.updateParams:
-        mpcController = MPCController(mpcParameters)
-        mpcParameters.updateParams = 0
 
-    u_ref, v_ref, w_ref, r_ref = mpc_step(mpcController)
-    sendCanPacket([39, ("int16", u_ref), ("int16", v_ref), ("int16", w_ref), ("int16", r_ref)])
-    time.sleep(mpcController.stepHorizon)
+    if mpcParameters.manualMode:
+        sendCanPacket([39, ("int16", 0), ("int16", 0), ("int16", 0), ("int16", 0)])
+        firstRun = 1
+        time.sleep(0.5)
+    else:
+        # The MPC-Controller is built when starting trajectory og target tracking, and settings can be changed when in target mode
+        if mpcParameters.activeTarget:
+            if firstRun:
+                mpcController = MPCController(mpcParameters)
+                next_mpc_time = time.time() + mpcController.stepHorizon
+                firstRun = 0
 
+            if mpcParameters.updateParams:
+                sendCanPacket([39, ("int16", 0), ("int16", 0), ("int16", 0), ("int16", 0)])
+                mpcController = MPCController(mpcParameters)
+                mpcParameters.updateParams = 0
+
+            u_ref, v_ref, w_ref, r_ref = mpc_step(mpcController, mpcTrajectory)
+
+            now = time.time()
+            if now < next_mpc_time:
+                time.sleep(next_mpc_time - now)
+
+            sendCanPacket([39, ("int16", u_ref), ("int16", v_ref), ("int16", w_ref), ("int16", r_ref)])
+            next_mpc_time += mpcController.stepHorizon
+
+        elif mpcParameters.activeTrajectory:
+            if firstRun:
+                if mpcParameters.whichTrajectory == 0:
+                    mpcTrajectory.updateToWaypoints(mpcController.state, 0)
+                elif mpcParameters.whichTrajectory == 1:
+                    mpcTrajectory.updateToWaypoints(mpcController.state, 1)
+                elif mpcParameters.whichTrajectory == 2:
+                    mpcTrajectory.updateToHelix(mpcController.state)
+
+                mpcController = MPCController(mpcParameters)
+                trajectory_time_start = time.time()
+                next_mpc_time = time.time() + mpcController.stepHorizon
+                firstRun = 0
+
+            mpcController.elapsed_time_trajectory = time.time() - trajectory_time_start
+            u_ref, v_ref, w_ref, r_ref = mpc_step(mpcController, mpcTrajectory)
+
+            now = time.time()
+            if now < next_mpc_time:
+                time.sleep(next_mpc_time - now)
+
+            sendCanPacket([39, ("int16", u_ref), ("int16", v_ref), ("int16", w_ref), ("int16", r_ref)])
+            next_mpc_time += mpcController.stepHorizon
+
+        else:
+            time.sleep(0.1) # In case of bug
 
   print("MPC Thread stopped")
 
@@ -168,14 +213,13 @@ class ComHandler:
     self.connectIp = ip
     self.connectPort = port
     self.servo = ServoPWM(pin=32, freq=50, startDT=7.5)
+    self.mpcInitController()   
     self.canInit()
+    self.mpcInitThread()
     self.camInit()
     self.netInit()
     self.heartBeat()
     self.i2cInit()
-    self.mpcInit()
-
-
 
   def canInit(self):
     self.bus = can.Bus(interface = self.canifaceType, channel = self.canifaceName, receive_own_messages = False, fd = False)
@@ -213,11 +257,34 @@ class ComHandler:
         else:
           message = json.loads(message)
           for item in message:
-
             if item[0] in canSendDict:
               if self.status['Can']:
                   msg = canSendDict[item[0]](item)
                   self.sendCanPacket(msg)
+
+                  if item[0] == 33:
+                     self.mpcController.target = ca.DM([item[1][0], item[1][1], item[1][2], item[1][3]])
+
+                  if item[0] == 34:
+                     self.mpcParams.Q = ca.DM([item[1][0], item[1][1], item[1][2], item[1][3]])
+                     self.mpcParams.R = ca.DM([item[1][4], item[1][5], item[1][6], item[1][7]])
+                     self.mpcParams.N = item[1][4]
+                     self.mpcParams.stepHorizon = item[1][4]
+                     self.mpcParams.desiredVelocity = item[1][4]
+
+                     self.mpcParams.u_max = item[1][4]
+                     self.mpcParams.v_max = item[1][4]
+                     self.mpcParams.w_max = item[1][4]
+                     self.mpcParams.r_max = item[1][4]
+
+                     self.mpcParams.u_ROC_max = item[1][4]
+                     self.mpcParams.v_ROC_max = item[1][4]
+                     self.mpcParams.w_ROC_max = item[1][4]
+                     self.mpcParams.r_ROC_max = item[1][4]
+
+                     self.mpcParams.manualMode = item[1][4]
+                     self.mpcParams.activeTrajectory = item[1][4]
+                     self.mpcParams.updateParams = item[1][4]
               else:
                 self.sendTcpPacket("Error: Canbus not initialised")
             elif item[0] in functionsParsingDict:
@@ -226,7 +293,7 @@ class ComHandler:
                 functionsParsingDict[item[0]][item[1][0]](item[1][1])
               else:
                 print(f"function: {item[0]}, action: {item[1][0]}, with value: {item[1][1]} failed")
-                #functionsParsingDict[item[0]](item[1])
+                #functionsParsingDict[item[0]](item[1])   
             else: 
               self.sendTcpPacket(f'Error: canId: {item[0]} not mapped')                        
       except Exception as e:
@@ -252,6 +319,11 @@ class ComHandler:
       dataByte = msg.data
       if canID in canReciveDict:
             jsonDict = canReciveDict[canID](canID, dataByte, self.uCstatus)
+
+            if canID == 129:
+                self.mpcController.state = ca.DM(struct.unpack('<hhhh',dataByte))
+            if canID == 130:
+                self.mpcController.u_prev = ca.DM(struct.unpack('<hhhh', dataByte))
       else:
             print(f"CanID: {canID} recived from ROV system not in parsing dict msg: {msg}")
             jsonDict = {"Error": f"CanID: {canID} recived from ROV system not in parsing dict with"}
@@ -266,12 +338,15 @@ class ComHandler:
     self.i2cThread = threading.Thread(name="i2cThread" ,target=i2cThread, daemon=True, args=(self.netHandler, self.STTS75, self.status))
     self.i2cThread.start()
 
-  def mpcInit(self):
+  def mpcInitController(self):
+    self.mode = 0 # Manual
     self.mpcParams = MPCParameters()
+    self.mpcTrajectory = MPCTrajectory()
     self.mpcController = MPCController(self.mpcParams)
-    self.mpcThread = threading.Thread(name="mpcThread", target=mpcThread, deamon=True, args=(self.mpcParams, self.mpcController, self.status, self.sendCanPacket))
-    self.mpcThread.start()
 
+  def mpcInitThread(self):
+    self.mpcThread = threading.Thread(name="mpcThread", target=mpcThread, daemon=True, args=(self.mpcParams, self.mpcTrajectory, self.mpcController, self.status, self.sendCanPacket))
+    self.mpcThread.start()
 
   #def PWM(self):
   #  self.servo = ServoPWM()
@@ -279,7 +354,7 @@ class ComHandler:
   #  self.PWMThread.start()
 
   def camInit(self):
-    #Gst.init([])
+    Gst.init([])
     self.stereo1Pipe = gstreamerPipe(pipeId="stereo1", port="5000")
     self.stereo1Thread = threading.Thread(target=self.stereo1Pipe.run)
     self.stereo1Thread.start()
@@ -328,6 +403,7 @@ class ComHandler:
       self.manipulatorPipe.stopPipe()
       self.camStatus['manipulator'] = False
     self.sendTcpPacket(f"Camera: {pipeId} stopped")
+     
 
 if __name__ == "__main__":
   c = ComHandler()
